@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cenk/backoff"
@@ -241,25 +243,114 @@ func (s *Server) doHealthcheck() {
 		metrics.HealthcheckStatus.Set(healthcheckResult)
 	}()
 
-	resp, err := http.Get(fmt.Sprintf("http://%s/latest/meta-data/instance-id", s.MetadataAddress))
+	req, err := http.NewRequest("GET", fmt.Sprintf("http://%s/latest/meta-data/instance-id", s.MetadataAddress), nil)
+	if err != nil {
+		errMsg = fmt.Sprintf("Error creating instance id request %+v", err)
+		log.Errorf(errMsg)
+		return
+	}
+
+	token, err := IMDSv2Token(s.MetadataAddress)
+	if err == nil {
+		if token != "" {
+			req.Header.Add("X-aws-ec2-metadata-token", token)
+		}
+	} else if err != errNotEnabled {
+		errMsg = fmt.Sprintf("Error creating instance id request %+v", err)
+		log.Errorf(errMsg)
+		return
+	}
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		errMsg = fmt.Sprintf("Error getting instance id %+v", err)
 		log.Errorf(errMsg)
 		return
 	}
+
 	if resp.StatusCode != 200 {
 		errMsg = fmt.Sprintf("Error getting instance id, got status: %+s", resp.Status)
 		log.Error(errMsg)
 		return
 	}
 	defer resp.Body.Close()
+
 	instanceID, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		errMsg = fmt.Sprintf("Error reading response body %+v", err)
 		log.Errorf(errMsg)
 		return
 	}
+
 	s.InstanceID = string(instanceID)
+}
+
+type errString string
+
+func (e errString) Error() string {
+	return string(e)
+}
+
+const (
+	errNotEnabled errString = "not enabled"
+)
+
+var (
+	expiration      int64
+	lastKnownToken  string
+	lastKnownTokenL sync.Mutex
+)
+
+func IMDSv2Token(mdaddr string) (string, error) {
+	if os.Getenv("IMDSV2_AUTH_REQUIRED") != "1" {
+		return "", errNotEnabled
+	}
+
+	if expiration > 0 && time.Now().Unix() <= expiration {
+		return lastKnownToken, nil
+	}
+
+	lastKnownTokenL.Lock()
+	defer lastKnownTokenL.Unlock()
+
+	var lkt string
+	if time.Now().Add(-10800*time.Second).Unix() <= expiration {
+		lkt = lastKnownToken
+	}
+
+	expiration = time.Now().Add(10800 * time.Second).Unix()
+	token, err := getIMDSv2Token(mdaddr)
+	if err != nil {
+		return lkt, err
+	}
+
+	lastKnownToken = token
+	return lastKnownToken, nil
+}
+
+func getIMDSv2Token(mdaddr string) (string, error) {
+	req, err := http.NewRequest("PUT", fmt.Sprintf("http://%s/latest/api/token", mdaddr), nil)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Add("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("invalid status code: %+s", resp.Status)
+	}
+
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 // HealthResponse represents a response for the health check.
